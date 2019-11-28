@@ -1,0 +1,253 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Deploy a service on AWS Fargate, hosted in the private subnets
+             using Service Discovery.
+
+###############################################################################
+# Parameters
+###############################################################################
+
+Parameters:
+  Environment:
+    Description: Environemnt type
+    Type: String
+    AllowedValues:
+      - production
+      - staging
+      - development
+    Default: development
+  ServiceName:
+    Description: A name for the service
+    Type: String
+    ConstraintDescription: you must specify a service name
+  BranchName:
+    Description: The git branch to pull from
+    Type: String
+    Default: master
+  S3BucketForTemplates:
+    Description: S3 Bucket holding this templates
+    Type: String
+  RepoImage:
+    Description: The name of the ECR image that contains the service code
+    Type: String
+  ContainerPort:
+    Description: What port number the application inside the docker container is binding to
+    Type: String
+    Default: 8000
+  DBPort:
+    Description: What port number the db is listening on
+    Type: String
+    Default: 5432
+  ContainerCpu:
+    # 256 (.25 vCPU) - Available memory values: 0.5GB, 1GB, 2GB
+    # 512 (.5 vCPU) - Available memory values: 1GB, 2GB, 3GB, 4GB
+    # 1024 (1 vCPU) - Available memory values: 2GB, 3GB, 4GB, 5GB, 6GB, 7GB, 8GB
+    # 2048 (2 vCPU) - Available memory values: Between 4GB and 16GB in 1GB increments
+    # 4096 (4 vCPU) - Available memory values: Between 8GB and 30GB in 1GB increments
+    Description: How much CPU to give the container. 1024 is 1 CPU
+    Type: Number
+    AllowedValues:
+      - 256
+      - 512
+      - 1024
+      - 2048
+      - 4096
+    Default: 1024
+  ContainerMemory:
+    Description: How much memory in megabytes to give the container
+    Type: Number
+    # arbitrarily stopping at 8GB, but we can go higher if needed
+    AllowedValues:
+      - 512
+      - 1024
+      - 2048
+      - 3072
+      - 4096
+      - 5120
+      - 6144
+      - 7168
+      - 8192
+    Default: 2048
+  DesiredCount:
+    Description: How many copies of the service task to run
+    Type: Number
+  Cluster:
+    Description: Cluster for the services
+    Type: String
+  DBStack:
+    Description: Parameter used to force DependsOn of one of the two possible RDS Stack
+    Type: String
+  Namespace:
+    Description: Service Discovery Namespace to register the Service with
+    Type: String
+  PostgresDBSecurityGroup:
+    Type: 'AWS::EC2::SecurityGroup::Id'
+  DBSecret:
+    Description: DB Password ARN
+    Type: String
+    Default: ''
+  DBMetricsSecret:
+    Description: DB Metrics Password ARN
+    Type: String
+    Default: ''
+
+###############################################################################
+# Conditions
+###############################################################################
+
+Conditions:
+  IsProd: !Equals
+    - !Ref Environment
+    - 'production'
+
+###############################################################################
+# Resources
+###############################################################################
+
+Resources:
+  ServiceSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Security Group to control access to and from this service
+      GroupName:
+        !Sub '${Environment}-${BranchName}-${ServiceName}'
+      VpcId:
+        Fn::ImportValue: !Sub '${Environment}:VPC'
+      SecurityGroupIngress:
+        # Ingress from inside the vpc
+        - IpProtocol: tcp
+          FromPort: !Ref ContainerPort
+          ToPort: !Ref ContainerPort
+          CidrIp:
+            Fn::ImportValue: !Sub '${Environment}:VPCCIDR'
+      SecurityGroupEgress:
+        # Egress to VPC including all DBs and ECR through VPC Endpoint
+        - IpProtocol: -1
+          FromPort: 0
+          ToPort: 65535
+          CidrIp:
+            Fn::ImportValue: !Sub '${Environment}:VPCCIDR'
+        # Egress to everything on https routes. Goes through Internet Gateway
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: '0.0.0.0/0'
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIpv6: '::/0'
+      Tags:
+        -
+          Key: Name
+          Value:
+            !Sub '${Environment}-${BranchName}-${ServiceName}'
+
+  DatabaseIngressFromService:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      Description: Accept traffic initiated from this service into the DB
+      GroupId:
+        !Ref PostgresDBSecurityGroup
+      IpProtocol: tcp
+      FromPort: !Ref DBPort
+      ToPort: !Ref DBPort
+      SourceSecurityGroupId:
+        Ref: ServiceSecurityGroup
+
+  # A log group for storing the stdout logs from this service's containers
+  LogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName:
+        !Sub '${Environment}-${BranchName}-${ServiceName}'
+      RetentionInDays: 30
+
+  TaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family:
+        !Sub '${Environment}-${BranchName}-${ServiceName}'
+      Cpu:
+        !Ref 'ContainerCpu'
+      Memory:
+        !Ref 'ContainerMemory'
+      NetworkMode: awsvpc
+      RequiresCompatibilities:
+        - FARGATE
+      ExecutionRoleArn:
+        Fn::ImportValue: !Sub '${Environment}:ECSTaskExecutionRole'
+      ContainerDefinitions:
+        - Name:
+            !Sub '${Environment}-${BranchName}-${ServiceName}'
+          Cpu:
+            !Ref 'ContainerCpu'
+          Memory:
+            !Ref 'ContainerMemory'
+          Image:
+            !Sub '${AWS::AccountId}.dkr.ecr.${AWS::Region}.${AWS::URLSuffix}/${RepoImage}'
+          PortMappings:
+            - ContainerPort: !Ref 'ContainerPort'
+          'Fn::Transform':
+            Name: AWS::Include
+            Parameters:
+              Location:
+                !Sub 's3://${S3BucketForTemplates}/partials/${ServiceName}-ENV.yml'
+          LogConfiguration:
+            LogDriver: 'awslogs'
+            Options:
+              awslogs-group:
+                !Sub '${Environment}-${BranchName}-${ServiceName}'
+              awslogs-region:
+                !Ref 'AWS::Region'
+              awslogs-stream-prefix:
+                !Sub '${Environment}-${BranchName}-${ServiceName}'
+
+  DiscoveryService:
+    Type: AWS::ServiceDiscovery::Service
+    Properties:
+      Description: Discovery Service for this service
+      DnsConfig:
+        RoutingPolicy: WEIGHTED
+        DnsRecords:
+          - TTL: 60
+            Type: A
+          - TTL: 60
+            Type: SRV
+      HealthCheckCustomConfig:
+        FailureThreshold: 2
+      Name:
+        !Ref ServiceName
+      NamespaceId:
+        !Ref Namespace
+
+  Service:
+    Type: AWS::ECS::Service
+    Properties:
+      ServiceName:
+        !Sub '${Environment}-${BranchName}-${ServiceName}'
+      Cluster:
+        !Ref Cluster
+      LaunchType: FARGATE
+      DeploymentConfiguration:
+        MaximumPercent: 200
+        MinimumHealthyPercent: 75
+      DesiredCount:
+        !Ref 'DesiredCount'
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          AssignPublicIp: DISABLED
+          SecurityGroups:
+            - Ref: ServiceSecurityGroup
+          Subnets:
+            - Fn::ImportValue: !Sub '${Environment}:PrivateSubnetOne'
+            - Fn::ImportValue: !Sub '${Environment}:PrivateSubnetTwo'
+      TaskDefinition:
+        Ref: TaskDefinition
+      ServiceRegistries:
+        - RegistryArn:
+            !GetAtt DiscoveryService.Arn
+          Port:
+            !Ref 'ContainerPort'
+
+###############################################################################
+# Outputs
+###############################################################################

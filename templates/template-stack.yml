@@ -1,0 +1,289 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: This stack deploys all the resources needed to host all microservices, with the exception of the network
+
+###############################################################################
+# Parameters
+###############################################################################
+
+Parameters:
+  AcmCertificateArn:
+    Description: ARN of the SSL certificate to serve. Currently onle us-east-1 is supported
+    Type: String
+  Environment:
+    Description: Environemnt type
+    Type: String
+    AllowedValues:
+      - production
+      - staging
+      - development
+    ConstraintDescription: Must specify production, staging, or development
+    Default: development
+  BranchName:
+    Description: The git branch that defines this deploy
+    Type: String
+    Default: master
+  DBSnapshotIdentifier:
+    Description: RDS Snapshot if passed
+    Type: String
+    Default: ''
+  DBPort:
+    Description: The port number on which the instances in the DB cluster accept connections
+    Type: String
+    Default: '5432'
+  DomainName:
+    Description: Your domain name
+    Type: String
+  ContainerPort:
+    Description: The port number the application inside the docker container is binding to
+    Type: String
+    Default: '8000'
+  ContainerCpu:
+    Description: How much CPU to give the container. 1024 is 1 CPU
+    Type: Number
+    Default: 1024
+  ContainerMemory:
+    Description: How much memory in megabytes to give the container
+    Type: Number
+    Default: 2048
+  RepoImageSomePublic:
+    Description: ECR image that contains the source for some public service
+    Type: String
+    Default: 'somepublic:master'
+  RepoImageSomePrivate:
+    Description: ECR image that contains the source for some private service
+    Type: String
+    Default: 'someprivate:master'
+  S3BucketForTemplates:
+    Description: S3 Bucket holding this templates
+    Type: String
+  MinServiceCount:
+    Description: Minimun amount of instances for the services based on AZs used
+    Type: Number
+    Default: 0
+
+###############################################################################
+# Conditions
+###############################################################################
+
+Conditions:
+  UseAuroraRDS: !Not
+    - !Equals
+      - !Ref Environment
+      - 'development'
+  UseSingleRDS: !Equals
+    - !Ref Environment
+    - 'development'
+  IsProd: !Equals
+    - !Ref Environment
+    - 'production'
+  DefinedMinCount: !Not
+    - !Equals
+      - !Ref MinServiceCount
+      - 0
+
+###############################################################################
+# Resources
+###############################################################################
+
+Resources:
+  PrivateNamespace:
+    Type: AWS::ServiceDiscovery::PrivateDnsNamespace
+    Properties:
+      Description: 'Namespace to register the services with'
+      Name:
+        !Sub '${BranchName}.${DomainName}.${Environment}'
+      Vpc:
+        Fn::ImportValue: !Sub '${Environment}:VPC'
+
+  ExternalECSCluster:
+    Type: AWS::ECS::Cluster
+    Properties:
+      ClusterName:
+        !Sub '${Environment}-${BranchName}-ExternalCluster'
+      Tags:
+        -
+          Key: Name
+          Value: !Sub '${Environment}-${BranchName}-ExternalCluster'
+
+  InternalECSCluster:
+    Type: AWS::ECS::Cluster
+    Properties:
+      ClusterName:
+        !Sub '${Environment}-${BranchName}-InternalCluster'
+      Tags:
+        -
+          Key: Name
+          Value: !Sub '${Environment}-${BranchName}-InternalCluster'
+
+  PostgresDBSecurityGroup:
+    Type: 'AWS::EC2::SecurityGroup'
+    Properties:
+      GroupName:
+        !Sub '${Environment}-${BranchName}-PostgresDBSecurityGroup'
+      GroupDescription: Security group for all postgres RDSs
+      VpcId:
+        Fn::ImportValue: !Sub '${Environment}:VPC'
+      SecurityGroupEgress:
+        - IpProtocol: -1
+          CidrIp:
+            Fn::ImportValue: !Sub '${Environment}:VPCCIDR'
+      Tags:
+        -
+          Key: Name
+          Value: !Sub '${Environment}-${BranchName}-PostgresDBSecurityGroup'
+
+  AuroraPostgres:
+    Type: AWS::CloudFormation::Stack
+    Condition: UseAuroraRDS
+    Properties:
+      TemplateURL: !Sub "https://s3.amazonaws.com/${S3BucketForTemplates}/template-aurora-postgres.yml"
+      Parameters:
+        DBSnapshotIdentifier:
+          !Ref DBSnapshotIdentifier
+        Environment:
+          !Ref Environment
+        BranchName:
+          !Ref BranchName
+        DBPort:
+          !Ref DBPort
+        PostgresDBSecurityGroup:
+          Ref: PostgresDBSecurityGroup
+
+  RDSPostgres:
+    Type: AWS::CloudFormation::Stack
+    Condition: UseSingleRDS
+    Properties:
+      TemplateURL: !Sub "https://s3.amazonaws.com/${S3BucketForTemplates}/template-rds-postgres.yml"
+      Parameters:
+        Name: 'DB'
+        DBSnapshotIdentifier:
+          !Ref DBSnapshotIdentifier
+        Environment:
+          !Ref Environment
+        BranchName:
+          !Ref BranchName
+        DBPort:
+          !Ref DBPort
+        PostgresDBSecurityGroup:
+          Ref: PostgresDBSecurityGroup
+
+  RDSMetricsPostgres:
+    Type: AWS::CloudFormation::Stack
+    Properties:
+      TemplateURL: !Sub "https://s3.amazonaws.com/${S3BucketForTemplates}/template-rds-postgres.yml"
+      Parameters:
+        Name: 'DBMetrics'
+        DBName: 'grafana_admin'
+        Environment:
+          !Ref Environment
+        BranchName:
+          !Ref BranchName
+        DBPort:
+          !Ref DBPort
+        PostgresDBSecurityGroup:
+          Ref: PostgresDBSecurityGroup
+
+  StaticWeb:
+    Type: AWS::CloudFormation::Stack
+    Properties:
+      TemplateURL: !Sub "https://s3.amazonaws.com/${S3BucketForTemplates}/template-static-website.yml"
+      Parameters:
+        Environment:
+          !Ref Environment
+        BranchName:
+          !Ref BranchName
+        DomainName:
+          !Ref DomainName
+        AcmCertificateArn:
+          !Ref AcmCertificateArn
+
+  SomePublicService:
+    Type: AWS::CloudFormation::Stack
+    Properties:
+      TemplateURL: !Sub "https://s3.amazonaws.com/${S3BucketForTemplates}/template-public-service.yml"
+      Parameters:
+        Environment:
+          !Ref Environment
+        BranchName:
+          !Ref BranchName
+        ServiceName: 'somepublic'
+        S3BucketForTemplates:
+          !Ref S3BucketForTemplates
+        RepoImage:
+          !Ref RepoImageSomePublic
+        ContainerPort:
+          !Ref ContainerPort
+        ContainerCpu:
+          !Ref ContainerCpu
+        ContainerMemory:
+          !Ref ContainerMemory
+        DesiredCount: !If
+          - DefinedMinCount
+          - !Ref MinServiceCount
+          - Fn::ImportValue:
+              !Sub '${Environment}:AZCount'
+        Cluster:
+          Ref: ExternalECSCluster
+        DBStack:
+          !If [ UseSingleRDS, !Ref RDSPostgres, !Ref AuroraPostgres ]
+        Namespace:
+          Fn::ImportValue: !Sub '${Environment}:PublicNamespace'
+        ServiceURL: !If
+          - IsProd
+          - !Sub 'somepublic.${DomainName}'
+          - !Sub '${Environment}_${BranchName}_somepublic.${DomainName}'
+        PostgresDBSecurityGroup:
+          Ref: PostgresDBSecurityGroup
+
+  SomePrivateService:
+    Type: AWS::CloudFormation::Stack
+    Properties:
+      TemplateURL: !Sub "https://s3.amazonaws.com/${S3BucketForTemplates}/template-private-service.yml"
+      Parameters:
+        Environment:
+          !Ref Environment
+        BranchName:
+          !Ref BranchName
+        ServiceName: 'someprivate'
+        S3BucketForTemplates:
+          !Ref S3BucketForTemplates
+        RepoImage:
+          !Ref RepoImageSomePrivate
+        ContainerPort:
+          !Ref ContainerPort
+        ContainerCpu:
+          !Ref ContainerCpu
+        ContainerMemory:
+          !Ref ContainerMemory
+        DesiredCount: !If
+          - DefinedMinCount
+          - !Ref MinServiceCount
+          - Fn::ImportValue:
+              !Sub '${Environment}:AZCount'
+        Cluster:
+          Ref: InternalECSCluster
+        DBStack:
+          !If [ UseSingleRDS, !Ref RDSPostgres, !Ref AuroraPostgres ]
+        Namespace:
+          Ref: PrivateNamespace
+        SomePublicUrl:
+          !GetAtt SomePublicService.Outputs.Route53CNAME
+        PostgresDBSecurityGroup:
+          Ref: PostgresDBSecurityGroup
+        DBSecret: !If
+          - UseSingleRDS
+          - !Sub '${RDSPostgres.Outputs.DBSecret}'
+          - !Sub '${AuroraPostgres.Outputs.DBSecret}'
+
+###############################################################################
+# Outputs
+###############################################################################
+
+Outputs:
+  Route53URL:
+    Description: The url of the ALB
+    Value:
+      !GetAtt SomePublicService.Outputs.Route53CNAME
+    Export:
+      Name:
+        !Sub '${Environment}:${BranchName}:Route53URL'

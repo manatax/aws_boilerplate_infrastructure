@@ -1,0 +1,129 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Bastion Host for SSH access into private subnets
+
+###############################################################################
+# Parameters
+###############################################################################
+
+Parameters:
+  S3BucketForSSH:
+    Description: S3 bucket name
+    Type: String
+  VPC:
+    Description: VPC ID
+    Type: String
+  Subnet:
+    Description: Subnet to place the bastion in
+    Type: String
+  Environment:
+    Description: Environemnt type
+    Type: String
+    AllowedValues:
+      - production
+      - staging
+      - development
+    ConstraintDescription: Must specify production, staging, or development
+    Default: development
+  AMI:
+    Description: Amazon Machine Image for Bastion
+    Type: String
+    # Defaults to us-west-2 Amazon Linux 2 AMI that includes aws-cli
+    Default: 'ami-04b762b4289fba92b'
+
+###############################################################################
+# Conditions
+###############################################################################
+
+###############################################################################
+# Resources
+###############################################################################
+
+Resources:
+  BastionSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName:
+        !Sub '${Environment}-BastionSecurityGroup'
+      GroupDescription: 'Security Group to control bastion access'
+      VpcId:
+        Ref: VPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIp: 0.0.0.0/0
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIpv6: ::/0
+      Tags:
+        -
+          Key: Name
+          Value: !Sub '${Environment}-BastionSecurityGroup'
+
+  BastionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Statement:
+        - Effect: Allow
+          Principal:
+            Service: [ ec2.amazonaws.com ]
+          Action: ['sts:AssumeRole']
+      Path: /
+      Policies:
+      - PolicyName: !Sub '${Environment}-BastionPolicy'
+        PolicyDocument:
+          Statement:
+          - Effect: Allow
+            Action:
+              - 's3:*'
+            Resource: '*'
+
+  BastionProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Path: /
+      Roles: [ !Ref BastionRole ]
+
+  Bastion:
+    Type: AWS::EC2::Instance
+    Properties:
+      ImageId: !Ref AMI
+      InstanceType: t3.micro
+      IamInstanceProfile: !Ref BastionProfile
+      KeyName: !Sub 'bastion.${Environment}'
+      NetworkInterfaces:
+        - AssociatePublicIpAddress: 'true'
+          DeviceIndex: '0'
+          GroupSet: [ !Ref BastionSecurityGroup ]
+          SubnetId: !Ref Subnet
+      Tags:
+        -
+          Key: Name
+          Value: !Sub 'bastion.${Environment}'
+      UserData:
+        'Fn::Base64':
+          !Sub |
+            #!/bin/bash
+            aws s3 sync s3://${S3BucketForSSH} /home/ec2-user/.ssh/
+            chmod 0600 /home/ec2-user/.ssh/*.pub
+            chown ec2-user:ec2-user /home/ec2-user/.ssh/*.pub
+
+###############################################################################
+# Outputs
+###############################################################################
+
+Outputs:
+  BastionSecurityGroup:
+    Description: The bastion security group
+    Value:
+      Ref: BastionSecurityGroup
+    Export:
+      Name: !Sub '${Environment}:BastionSecurityGroup'
+  BastionPublicIp:
+    Description: 'PublicIp Address from the bastion'
+    Value:
+      !GetAtt Bastion.PublicIp
+    Export:
+      Name: !Sub '${Environment}:BastionPublicIp'

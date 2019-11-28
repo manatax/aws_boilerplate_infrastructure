@@ -1,0 +1,14 @@
+temp/
+
+*.log
+*.csv
+*.dat
+*.out
+*.pid
+*.gz
+.env
+.env-*
+
+.DS_Store
+.built
+.vscode/

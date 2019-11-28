@@ -1,0 +1,355 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Deploy a service on AWS Fargate, hosted in the public subnets
+             behind a public load balancer.
+
+Metadata:
+  cfn-lint:
+    config:
+      ignore_checks:
+        - E3002
+        - W2001
+        - W8001
+
+###############################################################################
+# Parameters
+###############################################################################
+
+Parameters:
+  DomainName:
+    Description: Domain name used for Route53
+    Type: String
+  Environment:
+    Description: Environemnt type
+    Type: String
+    AllowedValues:
+      - production
+      - staging
+      - development
+  BranchName:
+    Description: The git branch to pull from
+    Type: String
+  ContainerPort:
+    Description: What port number the application inside the docker container is binding to
+    Type: String
+  DBPort:
+    Description: What port number the db is listening on
+    Type: String
+  ContainerCpu:
+    # 256 (.25 vCPU) - Available memory values: 0.5GB, 1GB, 2GB
+    # 512 (.5 vCPU) - Available memory values: 1GB, 2GB, 3GB, 4GB
+    # 1024 (1 vCPU) - Available memory values: 2GB, 3GB, 4GB, 5GB, 6GB, 7GB, 8GB
+    # 2048 (2 vCPU) - Available memory values: Between 4GB and 16GB in 1GB increments
+    # 4096 (4 vCPU) - Available memory values: Between 8GB and 30GB in 1GB increments
+    Description: How much CPU to give the container. 1024 is 1 CPU
+    Type: Number
+    AllowedValues:
+      - 256
+      - 512
+      - 1024
+      - 2048
+      - 4096
+  ContainerMemory:
+    Description: How much memory in megabytes to give the container
+    Type: Number
+    # arbitrarily stopping at 8GB, but we can go higher if needed
+    AllowedValues:
+      - 512
+      - 1024
+      - 2048
+      - 3072
+      - 4096
+      - 5120
+      - 6144
+      - 7168
+      - 8192
+  DesiredCount:
+    Description: How many copies of the service task to run
+    Type: Number
+  HealthCheckPath:
+    Description: Path of the endpoint to check the status of the service
+    Type: String
+  ServiceName:
+    Description: A name for the service
+    Type: String
+  RepoImage:
+    Description: The name of the ECR image that contains the service code
+    Type: String
+  Cluster:
+    Description: Cluster for the services
+    Type: String
+  VpcId:
+    Description: ID of the VPC
+    Type: String
+  VpcCidr:
+    Description: CIDR of the VPC
+    Type: String
+    AllowedPattern: ^(([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])\.){3}([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])(\/(1[6-9]|2[0-8]))$
+  ECSTaskExecutionRole:
+    Description: ARN for the Role to use
+    Type: String
+  DBStack:
+    Description: Parameter used to force DependsOn of one of the two possible RDS Stack
+    Type: String
+  ServiceURL:
+    Description: Route53 CNAME to register the Service with
+    Type: String
+  PostgresDBSecurityGroup:
+    Description: DB Security Group
+    Type: 'AWS::EC2::SecurityGroup::Id'
+  Subnets:
+    Description: List of Subnet IDs to place the service in
+    Type: List<AWS::EC2::Subnet::Id>
+  DBSecret:
+    Description: DB Password ARN
+    Type: String
+    Default: ''
+  DBMetricsSecret:
+    Description: DB Metrics Password ARN
+    Type: String
+    Default: ''
+  S3BucketForTemplates:
+    Description: S3 Bucket holding this templates
+    Type: String
+
+###############################################################################
+# Conditions
+###############################################################################
+
+Conditions:
+  IsProd: !Equals
+    - !Ref Environment
+    - 'production'
+
+###############################################################################
+# Resources
+###############################################################################
+
+Resources:
+  ServiceSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Security Group to control access to and from this service
+      GroupName:
+        !Sub '${Environment}-${BranchName}-${ServiceName}'
+      VpcId:
+        !Ref VpcId
+      SecurityGroupIngress:
+      # Ingress from VPC
+        - IpProtocol: tcp
+          FromPort: !Ref ContainerPort
+          ToPort: !Ref ContainerPort
+          CidrIp:
+            !Ref VpcCidr
+      SecurityGroupEgress:
+      # Egress to VPC including all DBs and ECR through VPC Endpoint
+        - IpProtocol: '-1'
+          FromPort: 0
+          ToPort: 65535
+          CidrIp:
+            !Ref VpcCidr
+      # Egress to access ECR
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: '0.0.0.0/0'
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIpv6: '::/0'
+      Tags:
+        -
+          Key: Name
+          Value:
+            !Sub '${Environment}-${BranchName}-${ServiceName}'
+
+  DatabaseIngressFromService:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      Description: Accept traffic initiated from this service into the DB
+      GroupId:
+        !Ref PostgresDBSecurityGroup
+      IpProtocol: tcp
+      FromPort: !Ref DBPort
+      ToPort: !Ref DBPort
+      SourceSecurityGroupId:
+        Ref: ServiceSecurityGroup
+
+  # A log group for storing the stdout logs from this service's containers
+  LogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName:
+        !Sub '${Environment}-${BranchName}-${ServiceName}'
+      RetentionInDays: 30
+
+  ALBSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName:
+        !Sub '${ServiceName}-ALB'
+      GroupDescription:
+        !Sub 'Security group for the ${ServiceName} ALB'
+      VpcId:
+        !Ref VpcId
+      SecurityGroupIngress:
+      # Ingress from the World
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: '0.0.0.0/0'
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIpv6: '::/0'
+      SecurityGroupEgress:
+      # Egress to the VPC
+        - IpProtocol: tcp
+          FromPort: !Ref ContainerPort
+          ToPort: !Ref ContainerPort
+          CidrIp:
+            !Ref VpcCidr
+      Tags:
+        -
+          Key: Name
+          Value:
+            !Sub '${ServiceName}-ALB'
+
+  ALB:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Name:
+        !Sub '${ServiceName}-ALB'
+      Scheme: 'internet-facing'
+      LoadBalancerAttributes:
+      - Key: idle_timeout.timeout_seconds
+        Value: '30'
+      Subnets:
+        !Ref Subnets
+      SecurityGroups:
+        - !Ref ALBSecurityGroup
+
+  ALBListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn:
+        Ref: ALB
+      Port: 443
+      Protocol: 'HTTPS'
+      Certificates:
+        - CertificateArn: 'arn:aws:acm:us-west-2:943816334875:certificate/bd422b3b-41ac-4c06-8301-1643fc0c7146'
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn:
+            Ref: TargetGroup
+
+  # A target group. This is used for keeping track of all the tasks, and what
+  # IP addresses / port numbers they have, so it can automatically distribute
+  # traffic across all the targets.
+  TargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      HealthCheckIntervalSeconds: 30
+      HealthCheckPath:
+        !Ref HealthCheckPath
+      HealthCheckProtocol: HTTP
+      HealthCheckTimeoutSeconds: 15
+      HealthyThresholdCount: 4
+      TargetType: ip
+      Name:
+        !Ref ServiceName
+      Port:
+        !Ref ContainerPort
+      Protocol: HTTP
+      UnhealthyThresholdCount: 4
+      VpcId:
+        !Ref VpcId
+
+  TaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family:
+        !Sub '${Environment}-${BranchName}-${ServiceName}'
+      Cpu:
+        !Ref 'ContainerCpu'
+      Memory:
+        !Ref 'ContainerMemory'
+      NetworkMode: awsvpc
+      RequiresCompatibilities:
+        - FARGATE
+      ExecutionRoleArn:
+        !Ref ECSTaskExecutionRole
+      ContainerDefinitions:
+        - Name:
+            !Sub '${Environment}-${BranchName}-${ServiceName}'
+          Cpu:
+            !Ref 'ContainerCpu'
+          Memory:
+            !Ref 'ContainerMemory'
+          Image:
+            !Sub '${AWS::AccountId}.dkr.ecr.${AWS::Region}.${AWS::URLSuffix}/${RepoImage}'
+          PortMappings:
+            - ContainerPort: !Ref 'ContainerPort'
+          'Fn::Transform':
+            Name: AWS::Include
+            Parameters:
+              Location:
+                !Sub 's3://${S3BucketForTemplates}/partials/${ServiceName}-ENV.yml'
+          LogConfiguration:
+            LogDriver: 'awslogs'
+            Options:
+              awslogs-group:
+                !Sub '${Environment}-${BranchName}-${ServiceName}'
+              awslogs-region:
+                !Ref 'AWS::Region'
+              awslogs-stream-prefix:
+                !Sub '${Environment}-${BranchName}-${ServiceName}'
+
+  Service:
+    Type: AWS::ECS::Service
+    DependsOn:
+      - ALB
+      - ALBListener
+    Properties:
+      ServiceName: !Sub '${Environment}-${BranchName}-${ServiceName}'
+      Cluster: !Ref Cluster
+      LaunchType: FARGATE
+      DeploymentConfiguration:
+        MaximumPercent: 200
+        MinimumHealthyPercent: 75
+      DesiredCount: !Ref 'DesiredCount'
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          AssignPublicIp: ENABLED
+          SecurityGroups:
+            - Ref: ServiceSecurityGroup
+          Subnets: !Ref Subnets
+      TaskDefinition:
+        Ref: TaskDefinition
+      LoadBalancers:
+        - ContainerName: !Ref ServiceName
+          ContainerPort: !Ref ContainerPort
+          TargetGroupArn:
+            Ref: TargetGroup
+
+  Route53CNAME:
+    Type: AWS::Route53::RecordSet
+    Properties:
+      HostedZoneName: !Ref DomainName
+      Name:
+        Ref: ServiceURL
+      Type: 'CNAME'
+      TTL: '86400'
+      ResourceRecords:
+        - !GetAtt ALB.DNSName
+
+###############################################################################
+# Outputs
+###############################################################################
+
+Outputs:
+  Route53CNAME:
+    Description: The url of the ALB
+    Value:
+      !Sub 'https://${Route53CNAME}'
+    Export:
+      Name: !Sub '${Environment}:${BranchName}:${ServiceName}:Route53CNAME'

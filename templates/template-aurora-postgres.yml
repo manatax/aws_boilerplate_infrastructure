@@ -1,0 +1,254 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: This stack deploys an Aurora Postgres Cluster. If provided, it uses a snapshot.
+
+###############################################################################
+# Parameters
+###############################################################################
+
+Parameters:
+  Environment:
+    Description: Environemnt type
+    Type: String
+    AllowedValues:
+      - production
+      - staging
+      - development
+    Default: development
+  BranchName:
+    Description: The git branch that defines this deploy
+    Type: String
+    Default: master
+  Name:
+    Description: The name for the database
+    Type: String
+    Default: DB
+  DBName:
+    Description: Specify a Name if an initial schema is needed
+    Type: String
+    Default: ''
+  DBSnapshotIdentifier:
+    Description: RDS Snapshot if passed
+    Type: String
+    Default: ''
+  DBInstanceClass:
+    Description: The compute and memory capacity of the DB instance
+    Type: String
+    AllowedValues:
+      - db.r4.large
+      - db.r4.xlarge
+      - db.r4.2xlarge
+      - db.r4.4xlarge
+      - db.r4.8xlarge
+      - db.r4.16xlarge
+    Default: db.r4.xlarge
+  Engine:
+    Description: The name of the database engine that you want to use for this DB instance
+    Type: String
+    Default: aurora-postgresql
+  EngineVersion:
+    Description: Postgres engine version
+    Type: String
+    Default: '9.6.15'
+    AllowedValues: ['11.2', '11.1', '10.7', '10.6', '10.5', '10.4', '10.3', '10.1', '9.6.15', '9.6.8']
+  Family:
+    Description: The DB cluster parameter group family name
+    Type: String
+    Default: aurora-postgresql9.6
+  DBMasterUsername:
+    Description: The master user name for the DB instance
+    Type: String
+    Default: postgres
+  PreferredBackupWindow:
+    Description: The daily time range (in UTC) during which automated backups are created
+    Type: String
+    Default: 07:00-07:30
+  DBBackupRetentionPeriod:
+    Description: the number of days that RDS should retain automatic backups for this instance
+    Type: Number
+    MinValue: 0
+    MaxValue: 14
+    Default: 7
+  PreferredMaintenanceWindow:
+    Description: The weekly time range (in UTC) during which system maintenance can occur
+    Type: String
+    Default: sat:07:30-sat:08:00
+  DBPort:
+    Description: The port number on which the instances in the DB cluster accept connections
+    Type: String
+    Default: '5432'
+  PubliclyAccessible:
+    Description: Indicates whether the DB instance is an internet-facing instance
+    Type: String
+    AllowedValues: [true, false]
+    Default: false
+  PostgresDBSecurityGroup:
+    Type: 'AWS::EC2::SecurityGroup::Id'
+  # Not currently parameterizable
+  # Feature requested Case: 6379594391
+  # DeletionPolicy:
+  #   Description: Define if you can backup, preserve or delete a resource when its stack is deleted
+  #   Type: String
+  #   AllowedValues: [Snapshot, Retain, Delete]
+  #   Default: Snapshot
+
+###############################################################################
+# Conditions
+###############################################################################
+
+Conditions:
+  HasDBSnapshotIdentifier: !Not
+    - !Equals
+      - !Ref DBSnapshotIdentifier
+      - ''
+  InitialDB: !Not
+    - !Equals
+      - !Ref DBName
+      - ''
+  NewDB: !Equals
+    - !Ref DBSnapshotIdentifier
+    - ''
+
+###############################################################################
+# Resources
+###############################################################################
+
+Resources:
+  DBSecretPassword:
+    Condition: NewDB
+    Type: 'AWS::SecretsManager::Secret'
+    Properties:
+      Name: !Sub '${Environment}-${BranchName}-${Name}Secret'
+      Description: This secret has a dynamically generated secret password
+      GenerateSecretString:
+        PasswordLength: 32
+        ExcludeCharacters: '"@/\'
+      Tags:
+        -
+          Key: Name
+          Value: !Sub '${Environment}-${BranchName}-${Name}Secret'
+
+  RDSDBClusterParameterGroup:
+    Type: "AWS::RDS::DBClusterParameterGroup"
+    Properties:
+      Description: "CloudFormation Aurora Cluster Parameter Group"
+      Family:
+        !Ref Family
+      Parameters:
+        rds.force_ssl: 1
+        client_encoding: 'UTF8'
+
+  DBCluster:
+    DeletionPolicy: Delete
+    Type: 'AWS::RDS::DBCluster'
+    Properties:
+      DBClusterParameterGroupName:
+        !Ref RDSDBClusterParameterGroup
+      BackupRetentionPeriod:
+        !Ref DBBackupRetentionPeriod
+      DBClusterIdentifier:
+        !Sub '${Environment}-${BranchName}-AuroraRDS'
+      DBSnapshotIdentifier:
+        !If [HasDBSnapshotIdentifier, !Ref DBSnapshotIdentifier, !Ref AWS::NoValue]
+      DBSubnetGroupName:
+        Fn::ImportValue: !Sub '${Environment}:PrivateDBSubnetGroup'
+      Engine:
+        !Ref Engine
+      EngineVersion:
+        !If [HasDBSnapshotIdentifier, !Ref 'AWS::NoValue', !Ref EngineVersion]
+      MasterUsername:
+        !Ref DBMasterUsername
+      MasterUserPassword:
+        !Sub '{{resolve:secretsmanager:${DBSecretPassword}:SecretString}}'
+      Port:
+        !Ref DBPort
+      PreferredBackupWindow:
+        !Ref PreferredBackupWindow
+      PreferredMaintenanceWindow:
+        !Ref PreferredMaintenanceWindow
+      VpcSecurityGroupIds:
+        - !Ref PostgresDBSecurityGroup
+
+  RDSDBParameterGroup:
+    Type: "AWS::RDS::DBParameterGroup"
+    Properties:
+      Description: "CloudFormation Sample Aurora Parameter Group"
+      Family:
+        !Ref Family
+      Parameters:
+        shared_preload_libraries: auto_explain,pg_stat_statements,pg_hint_plan,pgaudit
+        idle_in_transaction_session_timeout: 7200000
+        statement_timeout: 7200000
+
+  RDSDBInstanceOne:
+    Type: "AWS::RDS::DBInstance"
+    Properties:
+      DBInstanceIdentifier:
+        !Sub '${Environment}-${BranchName}-RDSOne'
+      DBName:
+        !If [InitialDB, !Ref DBName, !Ref 'AWS::NoValue']
+      AvailabilityZone:
+        Fn::ImportValue: !Sub '${Environment}:AvailabilityZoneOne'
+      DBClusterIdentifier:
+        !Sub '${Environment}-${BranchName}-AuroraRDS'
+      DBInstanceClass:
+        !Ref DBInstanceClass
+      DBParameterGroupName:
+        Ref: RDSDBParameterGroup
+      DBSubnetGroupName:
+        Fn::ImportValue: !Sub '${Environment}:PrivateDBSubnetGroup'
+      Engine:
+        !Ref Engine
+      EngineVersion:
+        !If [HasDBSnapshotIdentifier, !Ref 'AWS::NoValue', !Ref EngineVersion]
+      PubliclyAccessible:
+        !Ref PubliclyAccessible
+      UseDefaultProcessorFeatures: true
+
+  RDSDBInstanceTwo:
+    Type: "AWS::RDS::DBInstance"
+    Properties:
+      DBInstanceIdentifier:
+        !Sub '${Environment}-${BranchName}-RDSTwo'
+      AvailabilityZone:
+        Fn::ImportValue: !Sub '${Environment}:AvailabilityZoneTwo'
+      DBClusterIdentifier:
+        !Sub '${Environment}-${BranchName}-AuroraRDS'
+      DBInstanceClass:
+        !Ref DBInstanceClass
+      DBParameterGroupName:
+        Ref: RDSDBParameterGroup
+      DBSubnetGroupName:
+        Fn::ImportValue: !Sub '${Environment}:PrivateDBSubnetGroup'
+      Engine:
+        !Ref Engine
+      EngineVersion:
+        !If [HasDBSnapshotIdentifier, !Ref 'AWS::NoValue', !Ref EngineVersion]
+      PubliclyAccessible:
+        !Ref PubliclyAccessible
+      UseDefaultProcessorFeatures: true
+
+###############################################################################
+# Outputs
+###############################################################################
+
+Outputs:
+  DBReadEndpoint:
+    Description: The Read connection endpoint for the database.
+    Value:
+      Fn::GetAtt: 'DBCluster.ReadEndpoint.Address'
+    Export:
+      Name: !Sub '${Environment}:${BranchName}:${Name}ReadEndpoint'
+
+  DBWriteEndpoint:
+    Description: The Write connection endpoint for the database.
+    Value:
+      Fn::GetAtt: 'DBCluster.Endpoint.Address'
+    Export:
+      Name: !Sub '${Environment}:${BranchName}:${Name}WriteEndpoint'
+
+  DBSecret:
+    Description: Database credentials stored in Secrets
+    Value:
+      Ref: DBSecretPassword
+    Export:
+      Name: !Sub '${Environment}:${BranchName}:${Name}Secret'

@@ -1,0 +1,206 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: This stack deploy a simple Postgres RDS. If provided, it uses a snapshot.
+
+###############################################################################
+# Parameters
+###############################################################################
+
+Parameters:
+  Environment:
+    Description: Environemnt type
+    Type: String
+    AllowedValues:
+      - production
+      - staging
+      - development
+    Default: development
+  BranchName:
+    Description: The git branch that defines this deploy
+    Type: String
+    Default: master
+  Name:
+    Description: The name for the database
+    Type: String
+    Default: DB
+  DBName:
+    Description: Specify a Name if an initial schema is needed
+    Type: String
+    Default: ''
+  DBSnapshotIdentifier:
+    Description: RDS Snapshot if passed
+    Type: String
+    Default: ''
+  DBAllocatedStorage:
+    Description: Allocated storage size in GB
+    Type: Number
+    Default: 50
+    MinValue: 5
+    MaxValue: 16384
+  DBInstanceClass:
+    Description: The compute and memory capacity of the DB instance
+    Type: String
+    AllowedValues:
+      - db.r4.large
+      - db.r4.xlarge
+      - db.r4.2xlarge
+      - db.r4.4xlarge
+      - db.r4.8xlarge
+      - db.r4.16xlarge
+    Default: db.r4.large
+  Engine:
+    Description: The name of the database engine that you want to use for this DB instance
+    Type: String
+    Default: postgres
+  EngineVersion:
+    Description: 'PostgreSQL version.'
+    Type: String
+    Default: '9.6.15'
+    AllowedValues: ['9.6.8','9.6.9','9.6.10','9.6.11','9.6.12','9.6.14','9.6.15' ,'10.1','10.3','10.4','10.5','10.6','10.7','10.9','11.1','11.2','11.4']
+  DBMasterUsername:
+    Description: The master user name for the DB instance
+    Type: String
+    Default: 'postgres'
+  DBMultiAZ:
+    Description: Specifies if the database instance is deployed to multiple Availability Zones
+    Type: String
+    Default: false
+    AllowedValues: [true, false]
+  PreferredBackupWindow:
+    Description: The daily time range (in UTC) during which automated backups are created
+    Type: String
+    Default: 07:00-07:30
+  DBBackupRetentionPeriod:
+    Description: the number of days that RDS should retain automatic backups for this instance
+    Type: Number
+    Default: 0
+  PreferredMaintenanceWindow:
+    Description: The weekly time range (in UTC) during which system maintenance can occur
+    Type: String
+    Default: sat:07:30-sat:08:00
+  DBPort:
+    Description: The port number on which the instances accept connections
+    Type: String
+    Default: '5432'
+  PubliclyAccessible:
+    Description: Indicates whether the DB instance is an internet-facing instance
+    Type: String
+    AllowedValues: [true, false]
+    Default: false
+  PostgresDBSecurityGroup:
+    Type: 'AWS::EC2::SecurityGroup::Id'
+  # Not currently parameterizable
+  # Feature requested Case: 6379594391
+  # DeletionPolicy:
+  #   Description: Define if you can backup, preserve or delete a resource when its stack is deleted
+  #   Type: String
+  #   AllowedValues: [Snapshot, Retain, Delete]
+  #   Default: Snapshot
+
+###############################################################################
+# Conditions
+###############################################################################
+
+Conditions:
+  HasDBSnapshotIdentifier: !Not
+    - !Equals
+      - !Ref DBSnapshotIdentifier
+      - ''
+  InitialDB: !Not
+    - !Equals
+      - !Ref DBName
+      - ''
+  NewDB: !Equals
+    - !Ref DBSnapshotIdentifier
+    - ''
+
+###############################################################################
+# Resources
+###############################################################################
+
+Resources:
+  DBSecretPassword:
+    # Condition: NewDB
+    Type: 'AWS::SecretsManager::Secret'
+    Properties:
+      Name: !Sub '${Environment}-${BranchName}-${Name}Secret'
+      Description: This secret has a dynamically generated secret password
+      GenerateSecretString:
+        PasswordLength: 32
+        ExcludeCharacters: '"@/\'
+      Tags:
+        -
+          Key: Name
+          Value: !Sub '${Environment}-${BranchName}-${Name}Secret'
+
+  DBInstance:
+    DeletionPolicy: Delete
+    Type: 'AWS::RDS::DBInstance'
+    Properties:
+      DBInstanceIdentifier:
+        !Sub '${Environment}-${BranchName}-${Name}RDS'
+      DBName:
+        !If [InitialDB, !Ref DBName, !Ref 'AWS::NoValue']
+      AllocatedStorage:
+        !If [HasDBSnapshotIdentifier, !Ref 'AWS::NoValue', !Ref DBAllocatedStorage]
+      AllowMajorVersionUpgrade: false
+      AutoMinorVersionUpgrade: true
+      CopyTagsToSnapshot: true
+      DBInstanceClass:
+        !Ref DBInstanceClass
+      DBSnapshotIdentifier:
+        !If [HasDBSnapshotIdentifier, !Ref DBSnapshotIdentifier, !Ref 'AWS::NoValue']
+      DBSubnetGroupName:
+        Fn::ImportValue: !Sub '${Environment}:PrivateDBSubnetGroup'
+      Engine:
+        !Ref Engine
+      EngineVersion:
+        !If [HasDBSnapshotIdentifier, !Ref 'AWS::NoValue', !Ref EngineVersion]
+      MasterUsername:
+        !Ref DBMasterUsername
+      MasterUserPassword:
+        !Sub '{{resolve:secretsmanager:${DBSecretPassword}:SecretString}}'
+      MultiAZ:
+        !Ref DBMultiAZ
+      Port:
+        !Ref DBPort
+      # The instances of this type will be only used for feature development and
+      # do not require this kind of backup/mainenance
+      # PreferredBackupWindow:
+      #   !Ref PreferredBackupWindow
+      BackupRetentionPeriod:
+        !Ref DBBackupRetentionPeriod
+      # PreferredMaintenanceWindow:
+      #   !Ref PreferredMaintenanceWindow
+      PubliclyAccessible:
+        !Ref PubliclyAccessible
+      StorageType: gp2
+      StorageEncrypted:
+        !If [HasDBSnapshotIdentifier, !Ref 'AWS::NoValue', true]
+      VPCSecurityGroups:
+        - !Ref PostgresDBSecurityGroup
+
+###############################################################################
+# Outputs
+###############################################################################
+
+Outputs:
+  DBReadEndpoint:
+    Description: The Read connection endpoint for the database.
+    Value:
+      Fn::GetAtt: 'DBInstance.Endpoint.Address'
+    Export:
+      Name: !Sub '${Environment}:${BranchName}:${Name}ReadEndpoint'
+
+  DBWriteEndpoint:
+    Description: The Write connection endpoint for the database.
+    Value:
+      Fn::GetAtt: 'DBInstance.Endpoint.Address'
+    Export:
+      Name: !Sub '${Environment}:${BranchName}:${Name}WriteEndpoint'
+
+  DBSecret:
+    Description: Database credentials stored in Secrets
+    Value:
+      Ref: DBSecretPassword
+    Export:
+      Name: !Sub '${Environment}:${BranchName}:${Name}Secret'
